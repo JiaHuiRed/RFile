@@ -2,9 +2,8 @@
 #260518 JiaHuiRed RFile V0.1.0 — macOS 风格文件管理器
 import tkinter as tk
 from tkinter import ttk
-import ctypes, ctypes.wintypes as w, os, subprocess, datetime, shutil
-import threading
-from PIL import Image, ImageDraw, ImageFilter, ImageGrab, ImageTk
+import ctypes, ctypes.wintypes as w, os, subprocess, datetime, shutil, json
+from PIL import Image, ImageDraw, ImageFilter, ImageGrab, ImageTk, ImageFont
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -12,7 +11,7 @@ except:
     try: ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except: pass
 
-VERSION="V0.1.0";W=1200;H=810;MIN_W=800;MIN_H=500;RM=15;SW=255
+VERSION="V0.2.0";W=1200;H=810;MIN_W=800;MIN_H=500;RM=15;SW=255
 SW_MIN=100;SW_MAX=400;GC="#020202"
 
 THEMES=[
@@ -29,7 +28,7 @@ THEMES=[
      "sl":"#f2f2f7","ft":"#8e8e93","pb":"#f8f8f8","pf":"#1c1c1e","bn":"#007aff",
      "sa":"#e0e0e0","sh":"#cccccc","sel":"#c8c8c8","fh":"#f0f0f0","ff":"#555555","tc":0x80f7f2f2},
 ]
-TN=["🌙","🌿","🌞","☀️"]
+TN=["🌙","🌿","🌞","☀"]
 
 def drives():
     r=[];b=ctypes.windll.kernel32.GetLogicalDrives()
@@ -78,11 +77,16 @@ class RFile:
     def __init__(self):
         self.root=tk.Tk()
         self.root.withdraw()  # 启动时隐藏，先截屏再显示，消除毛玻璃首帧闪烁
-        self.root.title("RFile");self.root.overrideredirect(True)
+        self.root.title("RFile")
         self._set_app_icon()
         self.ti=2;self._t=THEMES[2];self.root.configure(bg=self._t["bg"])
         sw=self.root.winfo_screenwidth();sh=self.root.winfo_screenheight()
         self.root.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
+        self._freq_path=os.path.join(os.environ.get("APPDATA",""),".rfile","freq.json")
+        os.makedirs(os.path.dirname(self._freq_path),exist_ok=True)
+        try:
+            with open(self._freq_path,encoding="utf-8")as f:self._freq=json.load(f)
+        except:self._freq={}
         self.cp=os.path.expanduser("~");self.hist=[];self.hp=-1
         self.sc="name";self.sa=True;self._rd={};self._wd={};self._sash_d={};self._rm=None
         # 260518 Red 初始化剪切板操作标记，防止未复制直接粘贴触发 AttributeError
@@ -118,7 +122,10 @@ class RFile:
         self.cmenu.add_command(label="显示隐藏文件",command=self._cm_hidden)
         self._hidden_idx=self.cmenu.index("end")
 
+        self._iconified=False
         self.root.bind("<KeyPress>",self.on_key)
+        self.root.bind("<Map>",self._on_map)
+        self.root.bind("<Unmap>",self._on_unmap)
         self.tree.bind("<Button-3>",self._cm_show)
         self.root.bind("<Button-1>",self._click)
         self.root.bind("<B1-Motion>",self._drag)
@@ -127,8 +134,8 @@ class RFile:
         # 截屏模糊后再显示窗口，无闪烁
         self.root.update_idletasks()
         self._refresh_glass()
+        self._setup_hwnd()  # 在 deiconify 之前去掉标题栏，避免闪烁
         self.root.deiconify()
-        self.root.after(80,self._setup_hwnd)
 
     # ── 应用主题 ──
     def _apply(self,ti):
@@ -190,15 +197,35 @@ class RFile:
                 "R",fill=(255,255,255,255),font=font)
             self._icon_photo=ImageTk.PhotoImage(img)
             self.root.iconphoto(True,self._icon_photo)
+            # 保存临时 .ico，供 _setup_hwnd 通过 WM_SETICON 设置任务栏图标
+            import tempfile
+            self._ico_path=os.path.join(tempfile.gettempdir(),"_rfile_icon.ico")
+            img.save(self._ico_path,format="ICO",sizes=[(32,32),(48,48),(64,64)])
         except:pass
 
     def _setup_hwnd(self):
         try:
-            self._hwnd=self.root.winfo_id()
-            self._phwnd=ctypes.windll.user32.GetParent(self._hwnd)
-            for _h in filter(None,{self._hwnd,self._phwnd}):
-                ex=ctypes.windll.user32.GetWindowLongW(_h,-20)
-                ctypes.windll.user32.SetWindowLongW(_h,-20,(ex&~0x80)|0x40000)
+            content=self.root.winfo_id()
+            u32=ctypes.windll.user32
+            # wrapper 是含标题栏的外层窗口（GetParent 拿父窗口）
+            # 无 overrideredirect 时：content 是子窗口，wrapper 是带标题栏的父
+            wrapper=u32.GetParent(content) or content
+            self._hwnd=wrapper
+            # WS_POPUP|WS_SYSMENU|WS_MINIMIZEBOX：无边框，WS_MINIMIZEBOX 使任务栏点击发送 SC_MINIMIZE
+            u32.SetWindowLongW(wrapper,-16,0x80000000|0x00080000|0x00020000|0x04000000|0x02000000)
+            # WS_EX_APPWINDOW：强制任务栏按钮；移除 WS_EX_TOOLWINDOW
+            ex=u32.GetWindowLongW(wrapper,-20)
+            u32.SetWindowLongW(wrapper,-20,(ex&~0x80)|0x40000)
+            # SWP_FRAMECHANGED 强制立刻应用新样式
+            u32.SetWindowPos(wrapper,None,0,0,0,0,0x0001|0x0002|0x0004|0x0020)
+            # WM_SETICON 设置任务栏图标（restype=c_void_p 避免 64-bit handle 截断）
+            if hasattr(self,"_ico_path") and os.path.exists(self._ico_path):
+                u32.LoadImageW.restype=ctypes.c_void_p
+                hIcon=u32.LoadImageW(None,self._ico_path,1,0,0,0x10|0x40)
+                if hIcon:
+                    for h in filter(None,{wrapper,content}):
+                        u32.SendMessageW(h,0x0080,0,hIcon)
+                        u32.SendMessageW(h,0x0080,1,hIcon)
         except:pass
 
 # ── UI 构建 ──
@@ -308,6 +335,15 @@ class RFile:
             os.path.join(os.path.expanduser("~"),"Music")),("🎬 视频",
             os.path.join(os.path.expanduser("~"),"Videos"))]:
             y=self._sb_row(c,y,30,lbl,pa,t,False)
+        top3=[p for p in sorted(self._freq,key=self._freq.get,reverse=True)[:6]if os.path.isdir(p)][:3]
+        if top3:
+            y+=6
+            c.create_text(16,y+7,text="常用",anchor="w",fill=t["bn"],font=("Segoe UI",8,"bold"))
+            y+=20
+            for p in top3:
+                nm=os.path.basename(p) or p
+                y=self._sb_row(c,y,28,"📁 "+nm,p,t,False)
+            y+=4
         for r,l in drives():
             name=(f"{l} ({r[0].rstrip(chr(92))})"if l else r[0].rstrip(chr(92)))
             y=self._sb_row(c,y,30,name,r,t,True)
@@ -382,6 +418,11 @@ class RFile:
         if not os.path.exists(p):return
         if self.hp<len(self.hist)-1:self.hist=self.hist[:self.hp+1]
         self.hist.append(p);self.hp+=1;self.cp=p
+        self._freq[p]=self._freq.get(p,0)+1
+        try:
+            with open(self._freq_path,"w",encoding="utf-8")as f:json.dump(self._freq,f)
+        except:pass
+        self.root.after_idle(self._sb)
         self._tabs[self._active_tab].update({"path":p,"hist":self.hist[:],"hp":self.hp})
         self.pv.set(p);self._ub();self._ls(p);self._update_bc();self._draw_tabs()
 
@@ -439,7 +480,7 @@ class RFile:
         if e.widget==self.bar:
             items=self.bar.find_overlapping(e.x,e.y,e.x+1,e.y+1)
             if items and"bar_drag"in self.bar.gettags(items[-1]):
-                self._wd={"x":e.x_root,"y":e.y_root}
+                self._wd={"x":e.x_root,"y":e.y_root,"wx":self.root.winfo_x(),"wy":self.root.winfo_y()}
 
     def _drag(self,e):
         if self._rm and self._rd:
@@ -454,9 +495,10 @@ class RFile:
                 nh=max(MIN_H,d["wh"]-dy)
                 if nh!=d["wh"]:y=d["wy"]+(d["wh"]-nh);h=nh
             self.root.geometry(f"{w}x{h}+{x}+{y}");self.root.update_idletasks();return
-        if self._wd:
-            self.root.geometry(f"+{self.root.winfo_x()+e.x_root-self._wd['x']}+{self.root.winfo_y()+e.y_root-self._wd['y']}")
-            self._wd["x"]=e.x_root;self._wd["y"]=e.y_root
+        if self._wd and self._hwnd:
+            nx=self._wd["wx"]+e.x_root-self._wd["x"]
+            ny=self._wd["wy"]+e.y_root-self._wd["y"]
+            ctypes.windll.user32.SetWindowPos(self._hwnd,None,nx,ny,0,0,0x0001|0x0004|0x0010)
 
     def _rel(self,e):
         self._rd={};self._wd={};self._sash_d={};self._rm=None;self.root.configure(cursor="")
@@ -496,24 +538,14 @@ class RFile:
         if os.path.exists(p):self._nav(p)
         self._bc_edit_end()
     def _min(self):
-        if hasattr(self,"_tray_icon") and self._tray_icon:return
-        self.root.withdraw()
-        img=Image.new("RGBA",(64,64),(0,0,0,0))
-        d=ImageDraw.Draw(img)
-        d.ellipse([4,4,60,60],fill="#febc2e")
-        menu=pystray.Menu(
-            pystray.MenuItem("还原 RFile",self._tray_restore,default=True),
-            pystray.MenuItem("退出",lambda ic,it:self.root.after(0,self.root.destroy)))
-        self._tray_icon=pystray.Icon("RFile",img,"RFile",menu)
-        threading.Thread(target=self._tray_icon.run,daemon=True).start()
-
-    def _tray_restore(self,icon=None,item=None):
-        if hasattr(self,"_tray_icon") and self._tray_icon:
-            self._tray_icon.stop();self._tray_icon=None
-        def _restore():
-            self.root.deiconify()
-            self.root.after(200,self._refresh_glass)
-        self.root.after(0,_restore)
+        self.root.iconify()
+    def _on_map(self,e):
+        if e.widget is not self.root:return
+        self._iconified=False
+        self.root.after(200,self._refresh_glass)
+    def _on_unmap(self,e):
+        if e.widget is not self.root:return
+        self._iconified=True
     def _max(self):
         if hasattr(self,"_pre_max"):
             self.root.geometry(self._pre_max);del self._pre_max
